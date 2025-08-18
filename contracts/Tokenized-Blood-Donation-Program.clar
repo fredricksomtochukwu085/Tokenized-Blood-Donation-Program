@@ -16,6 +16,7 @@
 (define-data-var last-token-id uint u0)
 (define-data-var total-donations uint u0)
 (define-data-var emergency-mode bool false)
+(define-data-var next-milestone-id uint u1)
 
 (define-map donors principal 
   {
@@ -56,6 +57,24 @@
     priority-level: uint,
     request-height: uint,
     fulfilled: bool
+  })
+
+(define-map donor-milestones principal 
+  {
+    bronze-achieved: bool,
+    silver-achieved: bool,
+    gold-achieved: bool,
+    platinum-achieved: bool,
+    lifetime-hero: bool,
+    achievement-count: uint
+  })
+
+(define-map milestone-rewards uint
+  {
+    milestone-name: (string-ascii 20),
+    donation-threshold: uint,
+    reward-multiplier: uint,
+    special-status: bool
   })
 
 (define-read-only (get-last-token-id)
@@ -110,6 +129,45 @@
   (match (map-get? hospitals hospital)
     hospital-data (get total-received hospital-data)
     u0))
+
+(define-read-only (get-donor-milestones (donor principal))
+  (default-to 
+    {
+      bronze-achieved: false,
+      silver-achieved: false, 
+      gold-achieved: false,
+      platinum-achieved: false,
+      lifetime-hero: false,
+      achievement-count: u0
+    }
+    (map-get? donor-milestones donor)))
+
+(define-read-only (get-milestone-info (milestone-id uint))
+  (map-get? milestone-rewards milestone-id))
+
+(define-read-only (calculate-milestone-reward (donor principal))
+  (match (map-get? donors donor)
+    donor-data
+    (let ((donation-count (get total-donations donor-data))
+          (milestones (get-donor-milestones donor))
+          (achievement-count (get achievement-count milestones)))
+      (+ u500 (* achievement-count u250)))
+    u500))
+
+(define-read-only (get-next-milestone-threshold (donor principal))
+  (match (map-get? donors donor)
+    donor-data
+    (let ((donation-count (get total-donations donor-data)))
+      (if (<= donation-count u4)
+        u5
+        (if (<= donation-count u9) 
+          u10
+          (if (<= donation-count u24)
+            u25
+            (if (<= donation-count u49)
+              u50
+              u100)))))
+    u5))
 
 (define-public (register-donor (blood-type (string-ascii 3)))
   (let ((current-donor tx-sender))
@@ -171,6 +229,7 @@
               verified: true,
               rare-blood-bonus: is-rare
             })
+          (unwrap-panic (check-and-award-milestones donor (+ donation-count u1)))
           (map-set donors donor (merge donor-data 
             {
               total-donations: (+ donation-count u1),
@@ -244,6 +303,48 @@
     (var-set emergency-mode enabled)
     (ok true)))
 
+(define-public (claim-milestone-achievement (donor principal))
+  (match (map-get? donors donor)
+    donor-data
+    (let ((donation-count (get total-donations donor-data))
+          (current-milestones (get-donor-milestones donor)))
+      (check-and-award-milestones donor donation-count))
+    err-not-registered))
+
+(define-private (check-and-award-milestones (donor principal) (donation-count uint))
+  (let ((current-milestones (get-donor-milestones donor)))
+    (begin
+      (if (and (>= donation-count u5) (not (get bronze-achieved current-milestones)))
+        (map-set donor-milestones donor (merge current-milestones 
+          {bronze-achieved: true, achievement-count: (+ (get achievement-count current-milestones) u1)}))
+        true)
+      (if (and (>= donation-count u10) (not (get silver-achieved current-milestones)))
+        (map-set donor-milestones donor (merge (get-donor-milestones donor)
+          {silver-achieved: true, achievement-count: (+ (get achievement-count (get-donor-milestones donor)) u1)}))
+        true)
+      (if (and (>= donation-count u25) (not (get gold-achieved current-milestones)))
+        (map-set donor-milestones donor (merge (get-donor-milestones donor)
+          {gold-achieved: true, achievement-count: (+ (get achievement-count (get-donor-milestones donor)) u1)}))
+        true)
+      (if (and (>= donation-count u50) (not (get platinum-achieved current-milestones)))
+        (map-set donor-milestones donor (merge (get-donor-milestones donor)
+          {platinum-achieved: true, achievement-count: (+ (get achievement-count (get-donor-milestones donor)) u1)}))
+        true)
+      (if (and (>= donation-count u100) (not (get lifetime-hero current-milestones)))
+        (map-set donor-milestones donor (merge (get-donor-milestones donor)
+          {lifetime-hero: true, achievement-count: (+ (get achievement-count (get-donor-milestones donor)) u1)}))
+        true)
+      (ok true))))
+
+(define-private (initialize-milestones)
+  (begin
+    (map-set milestone-rewards u1 {milestone-name: "Bronze Donor", donation-threshold: u5, reward-multiplier: u2, special-status: false})
+    (map-set milestone-rewards u2 {milestone-name: "Silver Donor", donation-threshold: u10, reward-multiplier: u3, special-status: false})
+    (map-set milestone-rewards u3 {milestone-name: "Gold Donor", donation-threshold: u25, reward-multiplier: u4, special-status: true})
+    (map-set milestone-rewards u4 {milestone-name: "Platinum Donor", donation-threshold: u50, reward-multiplier: u5, special-status: true})
+    (map-set milestone-rewards u5 {milestone-name: "Lifetime Hero", donation-threshold: u100, reward-multiplier: u10, special-status: true})
+    (ok true)))
+
 (define-private (is-valid-blood-type (blood-type (string-ascii 3)))
   (or (is-eq blood-type "A+")
       (is-eq blood-type "A-")
@@ -259,3 +360,5 @@
 (map-set rare-blood-types "A-" true)
 (map-set rare-blood-types "B-" true)
 (map-set rare-blood-types "O-" true)
+
+(initialize-milestones)
