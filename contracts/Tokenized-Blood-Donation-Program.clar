@@ -12,11 +12,15 @@
 (define-constant err-invalid-hospital (err u106))
 (define-constant err-donation-not-found (err u107))
 (define-constant err-not-authorized (err u108))
+(define-constant err-insufficient-points (err u109))
+(define-constant err-reward-not-available (err u110))
+(define-constant err-invalid-reward-id (err u111))
 
 (define-data-var last-token-id uint u0)
 (define-data-var total-donations uint u0)
 (define-data-var emergency-mode bool false)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-reward-id uint u1)
 
 (define-map donors principal 
   {
@@ -75,6 +79,27 @@
     donation-threshold: uint,
     reward-multiplier: uint,
     special-status: bool
+  })
+
+(define-map reward-catalog uint
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    points-cost: uint,
+    available-quantity: uint,
+    category: (string-ascii 20),
+    active: bool
+  })
+
+(define-map donor-points principal uint)
+
+(define-map redemption-history uint
+  {
+    donor: principal,
+    reward-id: uint,
+    points-spent: uint,
+    redemption-date: uint,
+    status: (string-ascii 20)
   })
 
 (define-read-only (get-last-token-id)
@@ -169,6 +194,28 @@
               u100)))))
     u5))
 
+(define-read-only (get-donor-points (donor principal))
+  (default-to u0 (map-get? donor-points donor)))
+
+(define-read-only (get-reward-info (reward-id uint))
+  (map-get? reward-catalog reward-id))
+
+(define-read-only (get-available-rewards)
+  (var-get next-reward-id))
+
+(define-read-only (get-redemption-record (redemption-id uint))
+  (map-get? redemption-history redemption-id))
+
+(define-read-only (calculate-total-donor-points (donor principal))
+  (match (map-get? donors donor)
+    donor-data
+    (let ((donation-count (get total-donations donor-data))
+          (is-rare (get rare-blood-type donor-data))
+          (milestone-bonus (calculate-milestone-reward donor))
+          (base-points (* donation-count (if is-rare u1000 u500))))
+      (+ base-points milestone-bonus))
+    u0))
+
 (define-public (register-donor (blood-type (string-ascii 3)))
   (let ((current-donor tx-sender))
     (asserts! (is-none (map-get? donors current-donor)) err-already-registered)
@@ -241,6 +288,7 @@
             {total-received: (+ (get total-received hospital-data) u1)}))
           (map-set blood-type-counts blood-type 
             (+ (get-blood-type-count blood-type) u1))
+          (update-donor-points donor)
           (var-set last-token-id new-token-id)
           (var-set total-donations (+ (var-get total-donations) u1))
           (ok new-token-id)))
@@ -311,6 +359,67 @@
       (check-and-award-milestones donor donation-count))
     err-not-registered))
 
+(define-public (create-reward (name (string-ascii 50)) (description (string-ascii 200)) (points-cost uint) (quantity uint) (category (string-ascii 20)))
+  (let ((reward-id (var-get next-reward-id)))
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set reward-catalog reward-id
+      {
+        name: name,
+        description: description,
+        points-cost: points-cost,
+        available-quantity: quantity,
+        category: category,
+        active: true
+      })
+    (var-set next-reward-id (+ reward-id u1))
+    (ok reward-id)))
+
+(define-public (update-reward-quantity (reward-id uint) (new-quantity uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (match (map-get? reward-catalog reward-id)
+      reward-data
+      (begin
+        (map-set reward-catalog reward-id (merge reward-data {available-quantity: new-quantity}))
+        (ok true))
+      err-invalid-reward-id)))
+
+(define-public (toggle-reward-status (reward-id uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (match (map-get? reward-catalog reward-id)
+      reward-data
+      (begin
+        (map-set reward-catalog reward-id (merge reward-data {active: (not (get active reward-data))}))
+        (ok true))
+      err-invalid-reward-id)))
+
+(define-public (redeem-reward (reward-id uint))
+  (let ((donor tx-sender)
+        (current-points (get-donor-points donor))
+        (redemption-id (var-get next-reward-id)))
+    (match (map-get? reward-catalog reward-id)
+      reward-data
+      (let ((points-cost (get points-cost reward-data))
+            (available-qty (get available-quantity reward-data))
+            (is-active (get active reward-data)))
+        (asserts! is-active err-reward-not-available)
+        (asserts! (> available-qty u0) err-reward-not-available)
+        (asserts! (>= current-points points-cost) err-insufficient-points)
+        (map-set donor-points donor (- current-points points-cost))
+        (map-set reward-catalog reward-id (merge reward-data {available-quantity: (- available-qty u1)}))
+        (map-set redemption-history redemption-id
+          {
+            donor: donor,
+            reward-id: reward-id,
+            points-spent: points-cost,
+            redemption-date: stacks-block-height,
+            status: "redeemed"
+          })
+        (var-set next-reward-id (+ redemption-id u1))
+        (ok redemption-id))
+      err-invalid-reward-id)))
+
 (define-private (check-and-award-milestones (donor principal) (donation-count uint))
   (let ((current-milestones (get-donor-milestones donor)))
     (begin
@@ -336,6 +445,17 @@
         true)
       (ok true))))
 
+(define-private (update-donor-points (donor principal))
+  (let ((total-points (calculate-total-donor-points donor)))
+    (map-set donor-points donor total-points)
+    true))
+
+(define-read-only (is-reward-available (reward-id uint))
+  (match (map-get? reward-catalog reward-id)
+    reward-data
+    (and (get active reward-data) (> (get available-quantity reward-data) u0))
+    false))
+
 (define-private (initialize-milestones)
   (begin
     (map-set milestone-rewards u1 {milestone-name: "Bronze Donor", donation-threshold: u5, reward-multiplier: u2, special-status: false})
@@ -343,6 +463,15 @@
     (map-set milestone-rewards u3 {milestone-name: "Gold Donor", donation-threshold: u25, reward-multiplier: u4, special-status: true})
     (map-set milestone-rewards u4 {milestone-name: "Platinum Donor", donation-threshold: u50, reward-multiplier: u5, special-status: true})
     (map-set milestone-rewards u5 {milestone-name: "Lifetime Hero", donation-threshold: u100, reward-multiplier: u10, special-status: true})
+    (ok true)))
+
+(define-private (initialize-reward-catalog)
+  (begin
+    (unwrap-panic (create-reward "Priority Scheduling" "Skip the queue for your next donation appointment" u2000 u50 "scheduling"))
+    (unwrap-panic (create-reward "Health Checkup Voucher" "Free basic health screening at partner clinics" u5000 u20 "health"))
+    (unwrap-panic (create-reward "Donation T-Shirt" "Exclusive blood donor merchandise t-shirt" u1500 u100 "merchandise"))
+    (unwrap-panic (create-reward "Recognition Certificate" "Official certificate of appreciation for donations" u1000 u200 "recognition"))
+    (unwrap-panic (create-reward "VIP Donor Status" "Special recognition and benefits for one year" u10000 u10 "status"))
     (ok true)))
 
 (define-private (is-valid-blood-type (blood-type (string-ascii 3)))
@@ -362,3 +491,4 @@
 (map-set rare-blood-types "O-" true)
 
 (initialize-milestones)
+(initialize-reward-catalog)
