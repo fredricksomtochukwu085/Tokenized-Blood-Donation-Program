@@ -21,6 +21,9 @@
 (define-constant err-expired-blood-unit (err u113))
 (define-constant err-insufficient-inventory (err u114))
 (define-constant err-invalid-expiration-date (err u115))
+(define-constant err-invalid-referrer (err u116))
+(define-constant err-self-referral (err u117))
+(define-constant err-already-has-referrer (err u118))
 
 ;; Contract state variables
 (define-data-var last-token-id uint u0)
@@ -30,6 +33,7 @@
 (define-data-var next-reward-id uint u1)
 (define-data-var next-inventory-id uint u1)
 (define-data-var total-blood-units uint u0)
+(define-data-var next-referral-id uint u1)
 
 ;; Data maps
 (define-map donors principal 
@@ -130,6 +134,25 @@
     units-allocated: uint,
     allocation-date: uint,
     purpose: (string-ascii 100),
+    status: (string-ascii 20)
+  })
+
+(define-map donor-referrals principal
+  {
+    referrer: (optional principal),
+    total-referrals: uint,
+    successful-referrals: uint,
+    referral-points-earned: uint,
+    referral-tier: uint
+  })
+
+(define-map referral-records uint
+  {
+    referrer: principal,
+    referred-donor: principal,
+    referral-date: uint,
+    referred-donation-count: uint,
+    bonus-awarded: uint,
     status: (string-ascii 20)
   })
 
@@ -288,12 +311,69 @@
 (define-read-only (get-allocation-info (allocation-id uint))
   (map-get? inventory-allocations allocation-id))
 
+(define-read-only (get-referral-info (donor principal))
+  (default-to
+    {
+      referrer: none,
+      total-referrals: u0,
+      successful-referrals: u0,
+      referral-points-earned: u0,
+      referral-tier: u0
+    }
+    (map-get? donor-referrals donor)))
+
+(define-read-only (get-referral-record (referral-id uint))
+  (map-get? referral-records referral-id))
+
+(define-read-only (get-referral-tier (donor principal))
+  (let ((referral-data (get-referral-info donor))
+        (successful-refs (get successful-referrals referral-data)))
+    (if (>= successful-refs u50)
+      u5
+      (if (>= successful-refs u25)
+        u4
+        (if (>= successful-refs u10)
+          u3
+          (if (>= successful-refs u5)
+            u2
+            (if (>= successful-refs u1)
+              u1
+              u0)))))))
+
+(define-read-only (calculate-referral-bonus (referrer principal))
+  (let ((tier (get-referral-tier referrer)))
+    (if (is-eq tier u5)
+      u2500
+      (if (is-eq tier u4)
+        u1500
+        (if (is-eq tier u3)
+          u1000
+          (if (is-eq tier u2)
+            u500
+            u250))))))
+
+(define-read-only (get-referral-leaderboard-score (donor principal))
+  (let ((referral-data (get-referral-info donor)))
+    (+ (* (get successful-referrals referral-data) u1000)
+       (get referral-points-earned referral-data))))
+
 ;; Public functions
 (define-public (register-donor (blood-type (string-ascii 3)))
+  (register-donor-with-referral blood-type none))
+
+(define-public (register-donor-with-referral (blood-type (string-ascii 3)) (referrer (optional principal)))
   (let ((current-donor tx-sender))
     (asserts! (is-none (map-get? donors current-donor)) err-already-registered)
     (asserts! (is-valid-blood-type blood-type) err-invalid-blood-type)
-    (let ((is-rare (is-rare-blood-type blood-type)))
+    (match referrer
+      ref-principal
+      (begin
+        (asserts! (not (is-eq current-donor ref-principal)) err-self-referral)
+        (asserts! (is-some (map-get? donors ref-principal)) err-invalid-referrer)
+        true)
+      true)
+    (let ((is-rare (is-rare-blood-type blood-type))
+          (referral-id (var-get next-referral-id)))
       (map-set donors current-donor
         {
           blood-type: blood-type,
@@ -302,6 +382,33 @@
           rare-blood-type: is-rare,
           priority-status: is-rare
         })
+      (map-set donor-referrals current-donor
+        {
+          referrer: referrer,
+          total-referrals: u0,
+          successful-referrals: u0,
+          referral-points-earned: u0,
+          referral-tier: u0
+        })
+      (match referrer
+        ref-principal
+        (begin
+          (let ((ref-data (get-referral-info ref-principal)))
+            (map-set donor-referrals ref-principal
+              (merge ref-data
+                {total-referrals: (+ (get total-referrals ref-data) u1)}))
+            (map-set referral-records referral-id
+              {
+                referrer: ref-principal,
+                referred-donor: current-donor,
+                referral-date: stacks-block-height,
+                referred-donation-count: u0,
+                bonus-awarded: u0,
+                status: "pending"
+              })
+            (var-set next-referral-id (+ referral-id u1)))
+          true)
+        true)
       (ok true))))
 
 (define-public (register-hospital (name (string-ascii 50)) (location (string-ascii 100)))
@@ -362,6 +469,7 @@
           (map-set blood-type-counts blood-type 
             (+ (get-blood-type-count blood-type) u1))
           (update-donor-points donor)
+          (try! (process-referral-donation donor (+ donation-count u1)))
           (var-set last-token-id new-token-id)
           (var-set total-donations (+ (var-get total-donations) u1))
           (ok new-token-id)))
@@ -630,9 +738,31 @@
       (ok true))))
 
 (define-private (update-donor-points (donor principal))
-  (let ((total-points (calculate-total-donor-points donor)))
-    (map-set donor-points donor total-points)
+  (let ((total-points (calculate-total-donor-points donor))
+        (referral-data (get-referral-info donor))
+        (referral-bonus (get referral-points-earned referral-data)))
+    (map-set donor-points donor (+ total-points referral-bonus))
     true))
+
+(define-private (process-referral-donation (donor principal) (new-donation-count uint))
+  (let ((referral-data (get-referral-info donor)))
+    (match (get referrer referral-data)
+      referrer-principal
+      (let ((ref-data (get-referral-info referrer-principal))
+            (bonus (calculate-referral-bonus referrer-principal)))
+        (if (and (is-eq new-donation-count u1) (is-eq (get referred-donation-count (default-to {referrer: referrer-principal, referred-donor: donor, referral-date: u0, referred-donation-count: u0, bonus-awarded: u0, status: "pending"} (map-get? referral-records (- (var-get next-referral-id) u1)))) u0))
+          (begin
+            (map-set donor-referrals referrer-principal
+              (merge ref-data
+                {
+                  successful-referrals: (+ (get successful-referrals ref-data) u1),
+                  referral-points-earned: (+ (get referral-points-earned ref-data) bonus),
+                  referral-tier: (get-referral-tier referrer-principal)
+                }))
+            (update-donor-points referrer-principal)
+            (ok true))
+          (ok true)))
+      (ok true))))
 
 (define-read-only (is-reward-available (reward-id uint))
   (match (map-get? reward-catalog reward-id)
@@ -656,6 +786,7 @@
     (unwrap-panic (create-reward "Donation T-Shirt" "Exclusive blood donor merchandise t-shirt" u1500 u100 "merchandise"))
     (unwrap-panic (create-reward "Recognition Certificate" "Official certificate of appreciation for donations" u1000 u200 "recognition"))
     (unwrap-panic (create-reward "VIP Donor Status" "Special recognition and benefits for one year" u10000 u10 "status"))
+    (unwrap-panic (create-reward "Referral Champion Badge" "Exclusive badge for top referrers with lifetime benefits" u15000 u5 "recognition"))
     (ok true)))
 
 (define-private (is-valid-blood-type (blood-type (string-ascii 3)))
